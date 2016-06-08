@@ -1,0 +1,263 @@
+-- Need to add support for escaped characters inside string (?)
+-- Need to add support for vectors (Exercise 2 at bottom of parsing page)
+
+import Text.ParserCombinators.Parsec hiding (spaces)
+import System.Environment
+import Control.Monad
+import Control.Monad.Except
+import Numeric
+import Data.Char (digitToInt)
+
+main :: IO ()
+main = getArgs >>= print . eval . readExpr . head
+
+symbol :: Parser Char
+symbol = oneOf "!#$%&|*+-/:<=>?@^_~"
+
+readExpr :: String -> LispVal
+readExpr input = case parse parseExpr "lisp" input of
+	Left err -> String $ "No match: " ++ show err
+	Right val -> val
+
+spaces :: Parser ()
+spaces = skipMany1 space
+
+data LispVal = Atom String
+	| List [LispVal]
+	| DottedList [LispVal] LispVal
+	| Number Integer
+        | Float Float
+	| String String
+	| Bool Bool
+        | Character Char
+          deriving (Read, Eq)
+
+instance Show LispVal where show = showVal
+
+parseExpr :: Parser LispVal
+parseExpr = parseQuoted
+            <|> parseString 
+            <|> try parseCharacter
+            <|> try parseNumber
+            <|> parseAtom
+            <|> do char '('
+                   x <- try parseList <|> parseDottedList
+                   char ')'
+                   return x
+
+parseList :: Parser LispVal
+parseList = liftM List $ sepBy parseExpr spaces
+
+parseDottedList :: Parser LispVal
+parseDottedList = do
+  head <- endBy parseExpr spaces
+  tail <- char '.' >> spaces >> parseExpr
+  return $ DottedList head tail
+
+parseQuoted :: Parser LispVal
+parseQuoted = do
+  char '\''
+  x <- parseExpr
+  return $ List [Atom "quote", x]
+
+parseSpace :: Parser LispVal
+parseSpace = do
+  (try (string "#\\space")) <|> (string "#\\")
+  eof
+  return $ Character ' '
+
+parseNewline :: Parser LispVal
+parseNewline = do
+  string "#\\newline"
+  eof
+  return $ Character '\n'
+
+parseCharacter :: Parser LispVal
+parseCharacter = (try parseSpace) <|> (try parseNewline)
+                 <|> do string "#\\"
+                        x <- anyChar
+                        eof
+                        return $ Character x
+
+parseString :: Parser LispVal
+parseString = do
+	char '"'
+	x <- many (noneOf "\"")
+	char '"'
+	return $ String x
+
+parseAtom :: Parser LispVal
+parseAtom = do
+	first <- letter <|> symbol
+	rest <- many (letter <|> digit <|> symbol)
+	let atom = first:rest
+	return $ case atom of
+		"#t" -> Bool True
+		"#f" -> Bool False
+		_    -> Atom atom
+
+parseFloat :: Parser LispVal
+parseFloat = do
+  nums1 <- many1 digit
+  char '.'
+  nums2 <- many1 digit
+  eof
+  return $ Float $ fst $ (readFloat (nums1 ++ "." ++ nums2)) !! 0
+
+-- Can handle integers of different bases, not floats
+parseNumber :: Parser LispVal
+parseNumber = try ((many1 digit) >>= (return . Number . read)) 
+    <|> parseFloat
+    <|> parseNumberBase
+    where parseNumberBase = do 
+          char '#'
+          base <- (oneOf "bodx")
+          nums <- case base of
+             'b' -> many1 (oneOf "01")
+             'o' -> many1 (oneOf "01234567")
+             'd' -> many1 (oneOf "0123456789")
+             'x' -> many1 (oneOf "0123456789ABCDEF")
+          eof
+          return $ case base of
+             'b' -> Number $ fst $ (readBin nums) !! 0
+             'o' -> Number $ fst $ (readOct nums) !! 0
+             'd' -> Number $ fst $ (readDec nums) !! 0
+             'x' -> Number $ fst $ (readHex nums) !! 0
+             where readBin = readInt 2 (\x -> elem x ['0','1']) digitToInt
+
+
+
+
+
+
+
+--------------------------------------------------------
+
+showVal :: LispVal -> String
+showVal (String contents)      = "\"" ++ contents ++ "\""
+showVal (Character '\n')       = "#\\newline"
+showVal (Character ' ')        = "#\\space"
+showVal (Character contents)   = "#\\" ++ [contents]
+showVal (Atom name)            = name
+showVal (Number contents)      = show contents
+showVal (Float contents)       = show contents
+showVal (Bool True)            = "#t"
+showVal (Bool False)           = "#f"
+showVal (List contents)        = "(" ++ unwordsList contents ++ ")"
+showVal (DottedList head tail) = "(" ++ unwordsList head ++ " . "
+                                 ++ showVal tail ++ ")"
+
+unwordsList :: [LispVal] -> String
+unwordsList = unwords . map showVal
+
+
+-- need to eval DottedList (???)
+eval :: LispVal -> LispVal
+eval val@(Atom _)               = val
+eval (List [Atom "quote", val]) = val
+eval (List (Atom func : args))  = apply func $ map eval args
+eval val@(List _)               = val
+eval val@(DottedList _ _)       = val 
+eval val@(Number _)             = val
+eval val@(Float _)              = val
+eval val@(Bool _ )              = val
+eval val@(Character _)          = val
+
+
+apply :: String -> [LispVal] -> LispVal
+apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+
+primitives :: [(String, [LispVal] -> LispVal)]
+primitives = [("+", numericBinop (+)),
+              ("-", numericBinop (-)),
+              ("*", numericBinop (*)),
+              ("/", numericBinop div),
+              ("mod", numericBinop mod),
+              ("quotient", numericBinop quot),
+              ("remainder", numericBinop rem),
+              ("eq?", equalQ),
+              ("symbol?", List . (map $ symbolQ)),
+              ("string?", List . (map $ stringQ)),
+              ("number?", List . (map $ numberQ)),
+              ("boolean?", List . (map $ booleanQ)),
+              ("symbol->string", symbolToString . head)]
+
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
+numericBinop op params = Number $ foldl1 op $ map unpackNum params
+
+-- can't read strings in different bases yet
+unpackNum :: LispVal -> Integer
+unpackNum (Number n) = n
+unpackNum (String n) = let parsed = reads n :: [(Integer, String)] in
+                       if null parsed
+                          then 0
+                          else fst $ parsed !! 0
+unpackNum (List [n]) = unpackNum n
+unpackNum _          = 0
+
+stringQ :: LispVal -> LispVal
+stringQ (String _) = Bool True
+stringQ _          = Bool False
+
+symbolQ :: LispVal -> LispVal
+symbolQ (Atom str) = Bool True
+symbolQ _          = Bool False 
+
+numberQ :: LispVal -> LispVal
+numberQ (Number _) = Bool True
+numberQ _          = Bool False
+
+booleanQ :: LispVal -> LispVal
+booleanQ (Bool _) = Bool True
+booleanQ _        = Bool False
+
+listQ :: LispVal -> LispVal
+listQ (List _) = Bool True
+listQ _        = Bool False
+
+-- Compares equality for a list of arbitrary length (not just two vals)
+equalQ :: [LispVal] -> LispVal
+equalQ xs = Bool $ all (== (head xs)) (tail xs)
+
+-- Ask David why this doesn't work
+-- isLispType constructor (Bool _)   = Bool == constructor
+-- isLispType constructor (Number _) = Number == constructor
+-- isLispType constructor (String _) = String == constructor
+
+-- make this pass error when not given an Atom
+symbolToString :: LispVal -> LispVal
+symbolToString (Atom str) = String str
+symbolToString _          = String ""
+
+-- also make this error
+stringToSymbol :: LispVal -> LispVal
+stringToSymbol (String str) = Atom str
+stringToSymbol _            = Atom ""
+
+
+
+
+---------------------------------------------------------
+-- Part 3: Error Checking and Exceptions
+
+data LispError = NumArgs Integer [LispVal]
+               | TypeMismatch String LispVal
+               | Parser ParseError
+               | BadSpecialForm String LispVal
+               | NotFunction String String
+               | UnboundVar String String
+               | Default String
+instance Show LispError where show = showError
+
+
+showError :: LispError -> String
+showError (UnboundVar message varname)  = message ++ ": " ++ varname
+showError (BadSpecialForm message form) = message ++ ": " ++ show form
+showError (NotFunction message func)    = message ++ ": " ++ show func
+showError (NumArgs expected found)      = "Expected " ++ show expected
+                                          ++ "args; found values "
+                                          ++ unwordsList found
+showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected 
+                                          ++ ", found " ++ show found
+showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+
